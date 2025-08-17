@@ -1341,6 +1341,9 @@ void printCpuInstructionSet() {
 #if defined(__AVX2__)
     printf(" avx2");
 #endif
+#if defined(__AVXVNNI__)
+    printf(" vnni");
+#endif
 #if defined(__AVX512F__)
     printf(" avx512f");
 #endif

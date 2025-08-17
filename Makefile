@@ -6,7 +6,7 @@ ifndef TERMUX_VERSION
 endif
 
 ifdef DEBUG
-	CXXFLAGS += -g -fsanitize=address
+	CXXFLAGS += -fsanitize=address
 else
 	CXXFLAGS += -O3
 endif
