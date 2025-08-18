@@ -22,6 +22,7 @@ static const char *ropeTypeToString(NnRopeType type) {
 static const char *archTypeToString(LlmArchType type) {
     if (type == LLAMA) return "Llama";
     if (type == QWEN3) return "Qwen3";
+    if (type == QWEN3_MOE) return "Qwen3MoE";  // Currently using expert 0 as standard FFN
     throw std::runtime_error("Unsupported architecture");
 }
 
@@ -106,7 +107,9 @@ LlmHeader loadLlmHeader(const char *path, const NnUint maxSeqLen, NnFloatType sy
     header.syncType = syncType;
     header.fileSize = (NnSize)seekToEnd(fd);
 
-    if (header.archType == QWEN3)
+    // QWEN3_MOE inherits all QWEN3 behavior (Q/K normalization, RopeType, etc.)
+    // since it uses the same attention mechanism, just different FFN structure
+    if (header.archType == QWEN3 || header.archType == QWEN3_MOE)
         header.ropeType = ROPE_FALCON;
     return header;
 }
@@ -158,6 +161,41 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
     n.w3Slice = sliceRowMatmul(h->weightType, nNodes, h->dim, h->hiddenDim);
     n.wclsSlice = sliceRowMatmul(h->weightType, nNodes, h->dim, h->vocabSize);
 
+    // Initialize MoE-specific structures for QWEN3_MOE architecture
+    if (h->archType == QWEN3_MOE && h->nExperts > 0) {
+        // Router weights are shared across all nodes (not distributed)
+        n.routerSlice = sliceRowMatmul(F_32, 1, h->dim, h->nExperts);
+        
+        // Expert weights are split across nodes using standard tensor parallelism
+        // Each node has ALL experts but with split weights (like standard FFN)
+        // For 2 nodes: each expert's weights are split in half
+        // For 4 nodes: each expert's weights are split in quarters
+        n.expertsPerNode = h->nExperts;  // All experts on each node
+        n.expertToNodeMap = nullptr;     // Not needed for weight splitting
+        n.expertUpSlices = new NnRowMatmulSlice[nNodes];
+        n.expertGateSlices = new NnRowMatmulSlice[nNodes];
+        n.expertDownSlices = new NnColMatmulSlice[nNodes];
+        
+        for (NnUint nodeIndex = 0; nodeIndex < nNodes; nodeIndex++) {
+            // Expert up/gate weights: [nExperts * hiddenDim, dim] split by dim (columns)
+            // Each node gets: [nExperts * hiddenDim, dim/nNodes]
+            n.expertUpSlices[nodeIndex] = sliceRowMatmul(h->weightType, nNodes, h->nExperts * h->hiddenDim, h->dim);
+            n.expertGateSlices[nodeIndex] = sliceRowMatmul(h->weightType, nNodes, h->nExperts * h->hiddenDim, h->dim);
+            
+            // Expert down weights: [dim, nExperts * hiddenDim] split by rows  
+            // Each node gets: [dim/nNodes, nExperts * hiddenDim]
+            n.expertDownSlices[nodeIndex] = sliceColMatmul(h->weightType, nNodes, h->dim, h->nExperts * h->hiddenDim);
+        }
+    } else {
+        // Initialize MoE fields to null for non-MoE architectures
+        n.routerSlice = {};
+        n.expertUpSlices = nullptr;
+        n.expertGateSlices = nullptr; 
+        n.expertDownSlices = nullptr;
+        n.expertsPerNode = 0;
+        n.expertToNodeMap = nullptr;
+    }
+
     NnNetConfigBuilder netBuilder(nNodes, nBatches);
 
     n.positionPipeIndex = netBuilder.addPipe("POS", size2D(F_32, nBatches, 1));
@@ -195,8 +233,9 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
         const NnUint nKNormColumns = n.kSlice.d0 / n.header->headDim;
         const NnUint nInvBufferColumns = std::max(nQNormColumns, nKNormColumns);
 
+        // Both QWEN3 and QWEN3_MOE use per-head Q/K normalization (requires larger inv_rms buffer)
         const NnUint invRmsBufferIndex = nodeBuilder.addBuffer("inv_rms", size2D(F_32, nBatches,
-            h->archType == QWEN3 ? nInvBufferColumns : 1));
+            (h->archType == QWEN3 || h->archType == QWEN3_MOE) ? nInvBufferColumns : 1));
 
         const NnUint dBufferIndex = nodeBuilder.addBuffer("d", size2D(F_32, nBatches, n.w1Slice.d0));
         const NnUint dqBufferIndex = h->syncType == F_32
@@ -282,7 +321,8 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
                 size2D(h->weightType, n.vSlice.n, n.vSlice.d0),
                 NnMatmulOpConfig{});
 
-            if (h->archType == QWEN3) {
+            // Both QWEN3 and QWEN3_MOE require Q/K normalization after projection
+            if (h->archType == QWEN3 || h->archType == QWEN3_MOE) {
                 att.addOp(OP_INV_RMS, "block_norm_pre_q", layerIndex,
                     pointerBatchConfig(SRC_BUFFER, qBufferIndex),
                     pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex),
@@ -365,7 +405,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
                 NnCastOpCodeConfig{});
             att.addSync(zqPipeIndex, SYNC_NODE_SLICES);
 
-            // ff
+            // ff - Feed Forward Network (FFN or MoE)
             ff.addOp(
                 OP_MERGE_ADD, "block_merge_add2", layerIndex,
                 pointerBatchConfig(SRC_PIPE, zqPipeIndex),
@@ -392,44 +432,102 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
                     size0(),
                     NnCastOpCodeConfig{});
             }
-            ff.addOp(
-                OP_MATMUL, "block_matmul_w1", layerIndex,
-                pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
-                pointerBatchConfig(SRC_BUFFER, dBufferIndex),
-                size2D(h->weightType, n.w1Slice.n, n.w1Slice.d0),
-                NnMatmulOpConfig{});
-            ff.addOp(
-                OP_MATMUL, "block_matmul_w3", layerIndex,
-                pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
-                pointerBatchConfig(SRC_BUFFER, lBufferIndex),
-                size2D(h->weightType, n.w3Slice.n, n.w3Slice.d0),
-                NnMatmulOpConfig{});
-            ff.addOp(
-                OP_SILU, "block_act", layerIndex,
-                pointerBatchConfig(SRC_BUFFER, dBufferIndex),
-                pointerBatchConfig(SRC_BUFFER, dBufferIndex),
-                size0(),
-                NnSiluOpCodeConfig{});
-            ff.addOp(
-                OP_MUL, "block_mul", layerIndex,
-                pointerBatchConfig(SRC_BUFFER, dBufferIndex),
-                pointerBatchConfig(SRC_BUFFER, dBufferIndex),
-                size0(),
-                NnMulOpCodeConfig{lBufferIndex});
-            if (dBufferIndex != dqBufferIndex) {
+
+            if (h->archType == QWEN3_MOE && h->nExperts > 0) {
+                // ==== MoE COMPUTATION ====
+                // Add MoE-specific buffers
+                const NnUint routerLogitsBufferIndex = nodeBuilder.addBuffer("router_logits", 
+                    size2D(F_32, nBatches, h->nExperts));
+                const NnUint expertIndicesBufferIndex = nodeBuilder.addBuffer("expert_indices", 
+                    size2D(F_32, nBatches, h->nActiveExperts));  // Using F_32 to store indices as floats
+                const NnUint expertWeightsBufferIndex = nodeBuilder.addBuffer("expert_weights", 
+                    size2D(F_32, nBatches, h->nActiveExperts));
+                const NnUint expertOutputsBufferIndex = nodeBuilder.addBuffer("expert_outputs", 
+                    size2D(F_32, nBatches, h->nActiveExperts * h->dim));
+
+                // 1. Router computation: input -> expert logits
                 ff.addOp(
-                    OP_CAST, "block_cast_d2", layerIndex,
-                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
-                    pointerBatchConfig(SRC_BUFFER, dqBufferIndex),
+                    OP_MOE_ROUTER, "moe_router", layerIndex,
+                    pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, routerLogitsBufferIndex),
+                    size2D(F_32, h->dim, h->nExperts),  // Router weight matrix [dim, nExperts]
+                    NnMoeRouterOpConfig{h->nExperts, 0, routerLogitsBufferIndex});
+
+                // 2. Top-k expert selection: logits -> expert indices + weights
+                ff.addOp(
+                    OP_MOE_TOPK, "moe_topk", layerIndex,
+                    pointerBatchConfig(SRC_BUFFER, routerLogitsBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, expertIndicesBufferIndex),
                     size0(),
-                    NnCastOpCodeConfig{});
+                    NnMoeTopKOpConfig{h->nExperts, h->nActiveExperts, routerLogitsBufferIndex, 
+                                      expertIndicesBufferIndex, expertWeightsBufferIndex});
+
+                // 3. Expert FFN computation: input + expert_id -> expert output
+                // Use existing MATMUL operations with expert weights (reusing existing logic)
+                const NnUint expertUpBufferIndex = nodeBuilder.addBuffer("expert_up", 
+                    size2D(F_32, nBatches, h->nActiveExperts * n.expertUpSlices[nodeIndex].d0));
+                const NnUint expertGateBufferIndex = nodeBuilder.addBuffer("expert_gate", 
+                    size2D(F_32, nBatches, h->nActiveExperts * n.expertGateSlices[nodeIndex].d0));
+
+                ff.addOp(
+                    OP_MOE_EXPERT_FFN, "moe_expert_ffn", layerIndex,
+                    pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, expertOutputsBufferIndex),
+                    size0(),  // Weight size computed dynamically in the operation
+                    NnMoeExpertFFNOpConfig{h->nActiveExperts, h->hiddenDim, expertIndicesBufferIndex,
+                                           expertWeightsBufferIndex, expertOutputsBufferIndex,
+                                           expertUpBufferIndex, expertGateBufferIndex});
+
+                // 4. Combine expert outputs: expert outputs + weights -> final output
+                ff.addOp(
+                    OP_MOE_COMBINE, "moe_combine", layerIndex,
+                    pointerBatchConfig(SRC_BUFFER, expertOutputsBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, yBufferIndex),
+                    size0(),
+                    NnMoeCombineOpConfig{h->nActiveExperts, expertOutputsBufferIndex, 
+                                         expertWeightsBufferIndex, 0});
+            } else {
+                // ==== STANDARD FFN COMPUTATION ====
+                ff.addOp(
+                    OP_MATMUL, "block_matmul_w1", layerIndex,
+                    pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                    size2D(h->weightType, n.w1Slice.n, n.w1Slice.d0),
+                    NnMatmulOpConfig{});
+                ff.addOp(
+                    OP_MATMUL, "block_matmul_w3", layerIndex,
+                    pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, lBufferIndex),
+                    size2D(h->weightType, n.w3Slice.n, n.w3Slice.d0),
+                    NnMatmulOpConfig{});
+                ff.addOp(
+                    OP_SILU, "block_act", layerIndex,
+                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                    size0(),
+                    NnSiluOpCodeConfig{});
+                ff.addOp(
+                    OP_MUL, "block_mul", layerIndex,
+                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                    size0(),
+                    NnMulOpCodeConfig{lBufferIndex});
+                if (dBufferIndex != dqBufferIndex) {
+                    ff.addOp(
+                        OP_CAST, "block_cast_d2", layerIndex,
+                        pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                        pointerBatchConfig(SRC_BUFFER, dqBufferIndex),
+                        size0(),
+                        NnCastOpCodeConfig{});
+                }
+                ff.addOp(
+                    OP_MATMUL, "block_matmul_w2", layerIndex,
+                    pointerBatchConfig(SRC_BUFFER, dqBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, yBufferIndex),
+                    size2D(h->weightType, n.w2Slice.n0, n.w2Slice.d),
+                    NnMatmulOpConfig{});
             }
-            ff.addOp(
-                OP_MATMUL, "block_matmul_w2", layerIndex,
-                pointerBatchConfig(SRC_BUFFER, dqBufferIndex),
-                pointerBatchConfig(SRC_BUFFER, yBufferIndex),
-                size2D(h->weightType, n.w2Slice.n0, n.w2Slice.d),
-                NnMatmulOpConfig{});
+
             ff.addOp(
                 OP_CAST, "block_cast_d3", layerIndex,
                 pointerBatchConfig(SRC_BUFFER, yBufferIndex),
@@ -494,6 +592,20 @@ void releaseLlmNet(LlmNet *net) {
         releaseNodeConfig(&net->nodeConfigs[nodeIndex]);
     releaseNetConfig(&net->netConfig);
     delete[] net->nodeConfigs;
+    
+    // Clean up MoE-specific memory allocations
+    if (net->expertUpSlices != nullptr) {
+        delete[] net->expertUpSlices;
+        net->expertUpSlices = nullptr;
+    }
+    if (net->expertGateSlices != nullptr) {
+        delete[] net->expertGateSlices;
+        net->expertGateSlices = nullptr;
+    }
+    if (net->expertDownSlices != nullptr) {
+        delete[] net->expertDownSlices;
+        net->expertDownSlices = nullptr;
+    }
 }
 
 void loadLlmNetWeight(const char *path, LlmNet *net, NnRootWeightLoader *loader) {
@@ -516,10 +628,38 @@ void loadLlmNetWeight(const char *path, LlmNet *net, NnRootWeightLoader *loader)
         b += loader->loadRowMatmulSlices("block_matmul_k", layerIndex, &net->kSlice, b);
         b += loader->loadRowMatmulSlices("block_matmul_v", layerIndex, &net->vSlice, b);
         b += loader->loadColMatmulSlices("block_matmul_wo", layerIndex, &net->woSlice, b);
-        b += loader->loadRowMatmulSlices("block_matmul_w1", layerIndex, &net->w1Slice, b);
-        b += loader->loadColMatmulSlices("block_matmul_w2", layerIndex, &net->w2Slice, b);
-        b += loader->loadRowMatmulSlices("block_matmul_w3", layerIndex, &net->w3Slice, b);
-        if (net->header->archType == QWEN3) {
+        
+        if (net->header->archType == QWEN3_MOE && net->header->nExperts > 0) {
+            // ==== MoE WEIGHT LOADING WITH TENSOR PARALLELISM ====
+            // Skip standard FFN weights (expert 0 is loaded with all experts in the MoE section)
+            NnUint ffnWeightSize = net->header->hiddenDim * net->header->dim;
+            NnUint bytesPerWeight = getBytes(net->header->weightType, 1);
+            b += ffnWeightSize * bytesPerWeight * 3;  // Skip w1, w2, w3 (expert 0 weights)
+            
+            // Load router weights (F32, shared across all nodes)
+            b += loader->loadAll("moe_router", layerIndex, net->routerSlice.size.nBytes, b);
+            
+            // Load expert weights using standard tensor parallelism (reusing existing logic)
+            // Expert up weights: [nExperts * hiddenDim, dim] - split by columns like w1
+            b += loader->loadRowMatmulSlices("moe_expert_up", layerIndex, &net->expertUpSlices[0], b);
+            
+            // Expert gate weights: [nExperts * hiddenDim, dim] - split by columns like w3  
+            b += loader->loadRowMatmulSlices("moe_expert_gate", layerIndex, &net->expertGateSlices[0], b);
+            
+            // Expert down weights: [dim, nExperts * hiddenDim] - split by rows like w2
+            b += loader->loadColMatmulSlices("moe_expert_down", layerIndex, &net->expertDownSlices[0], b);
+            
+            printf("🔀 MoE weights loaded: router + %u experts with tensor parallelism (%u nodes)\n", 
+                   net->header->nExperts, net->netConfig.nNodes);
+        } else {
+            // Standard FFN weights for dense models (LLAMA, QWEN3)
+            b += loader->loadRowMatmulSlices("block_matmul_w1", layerIndex, &net->w1Slice, b);
+            b += loader->loadColMatmulSlices("block_matmul_w2", layerIndex, &net->w2Slice, b);
+            b += loader->loadRowMatmulSlices("block_matmul_w3", layerIndex, &net->w3Slice, b);
+        }
+        
+        // Both QWEN3 and QWEN3_MOE use Q/K normalization weights (same format)
+        if (net->header->archType == QWEN3 || net->header->archType == QWEN3_MOE) {
             b += loader->loadAll("block_norm_q", layerIndex, net->qkRmsNormSize.nBytes, b);
             b += loader->loadAll("block_norm_k", layerIndex, net->qkRmsNormSize.nBytes, b);
         }

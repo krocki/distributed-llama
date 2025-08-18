@@ -66,6 +66,22 @@ typedef struct {
     NnSize2D attSize;
 } NnMultiHeadAttSlice;
 
+/**
+ * MoE expert weight slice for distributed expert computation.
+ * Distributes expert weights across nodes for load balancing.
+ */
+typedef struct {
+    NnFloatType type;             // Weight quantization type (Q40, F32, etc.)
+    NnUint nNodes;                // Total number of nodes in cluster
+    NnUint nExperts;              // Total number of experts (128)
+    NnUint expertsPerNode;        // Number of experts per node (nExperts / nNodes)
+    NnUint hiddenDim;             // Expert hidden dimension (768)
+    NnUint dim;                   // Model dimension (2048)
+    NnSize2D totalSize;           // Total expert weights size [nExperts * hiddenDim, dim]
+    NnSize2D nodeSize;            // Per-node expert weights size [expertsPerNode * hiddenDim, dim]
+    NnUint nodeExpertOffset;      // First expert index handled by this node
+} NnMoeExpertSlice;
+
 // base enums
 
 enum NnOpCode {
@@ -81,6 +97,11 @@ enum NnOpCode {
     OP_MUL,
     OP_CAST,
     OP_SHIFT,
+    // Mixture of Experts operations (weight-split tensor parallelism approach)
+    OP_MOE_ROUTER,        // Router: input [batch,dim] @ router_weights [dim,nExperts] -> logits [batch,nExperts]
+    OP_MOE_TOPK,          // Top-K: select top 8 experts from 128, apply softmax -> indices + weights
+    OP_MOE_EXPERT_FFN,    // Expert FFN: compute SILU(x@W_up) * (x@W_gate) @ W_down for selected experts
+    OP_MOE_COMBINE,       // Combine: weighted sum of expert outputs -> final result [batch,dim]
 };
 
 enum NnOpQuantType {
@@ -95,7 +116,7 @@ enum NnOpQuantType {
     Q80_F32_F32,
 };
 
-#define N_OP_CODES (OP_SHIFT + 1)
+#define N_OP_CODES (OP_MOE_COMBINE + 1)
 #define N_OP_QUANTS (Q80_F32_F32 + 1)
 
 enum NnPointerSource {
@@ -250,6 +271,57 @@ typedef struct {
     NnUint indexPipeIndex;
 } NnShiftOpCodeConfig;
 
+// Mixture of Experts operation configurations
+
+/**
+ * Configuration for MoE router operation.
+ * Computes expert routing probabilities from input tokens using shared router weights.
+ * Router weights are identical on all nodes (not split in tensor parallelism).
+ */
+typedef struct {
+    NnUint nExperts;              // Total number of experts (e.g., 128 for Qwen3-MoE)
+    NnUint routerWeightIndex;     // Buffer index for router weight matrix [dim, nExperts]
+    NnUint routerLogitsIndex;     // Buffer index for router logits output [batch, nExperts]
+} NnMoeRouterOpConfig;
+
+/**
+ * Configuration for MoE top-k expert selection operation.
+ * Selects top-k experts per token and normalizes their weights.
+ */
+typedef struct {
+    NnUint nExperts;              // Total number of experts
+    NnUint nActiveExperts;        // Number of active experts per token (e.g., 8)
+    NnUint routerLogitsIndex;     // Buffer index for router logits [batch, nExperts]
+    NnUint expertIndicesIndex;    // Buffer index for selected expert indices [batch, nActiveExperts]
+    NnUint expertWeightsIndex;    // Buffer index for normalized expert weights [batch, nActiveExperts]
+} NnMoeTopKOpConfig;
+
+/**
+ * Configuration for MoE expert FFN computation operation.
+ * Computes FFN outputs for selected experts using weight-split tensor parallelism.
+ * Expert weights are distributed across nodes: each node has partial weights for all experts.
+ */
+typedef struct {
+    NnUint nActiveExperts;        // Number of active experts per token (e.g., 8 for Qwen3-MoE)
+    NnUint hiddenDim;             // Expert hidden dimension (e.g., 768 for Qwen3-MoE)
+    NnUint expertIndicesIndex;    // Buffer index for selected expert indices [batch, nActiveExperts]
+    NnUint expertWeightsIndex;    // Buffer index for expert routing weights [batch, nActiveExperts]
+    NnUint expertOutputsIndex;    // Buffer index for expert FFN outputs [batch, nActiveExperts, dim]
+    NnUint expertUpBufferIndex;   // Buffer index for expert up projection partial results (tensor parallel)
+    NnUint expertGateBufferIndex; // Buffer index for expert gate projection partial results (tensor parallel)
+} NnMoeExpertFFNOpConfig;
+
+/**
+ * Configuration for MoE output combination operation.
+ * Combines expert outputs using routing weights to produce final result.
+ */
+typedef struct {
+    NnUint nActiveExperts;        // Number of active experts per token
+    NnUint expertOutputsIndex;    // Buffer index for expert outputs [batch, nActiveExperts, dim]
+    NnUint expertWeightsIndex;    // Buffer index for expert routing weights [batch, nActiveExperts]
+    NnUint combinedOutputIndex;   // Buffer index for final combined output [batch, dim]
+} NnMoeCombineOpConfig;
+
 // utility functions
 
 const char *opCodeToString(NnOpCode code);
@@ -288,6 +360,23 @@ NnRowMatmulSlice sliceRowMatmul(NnFloatType type, NnUint nNodes, NnUint n, NnUin
 NnColMatmulSlice sliceColMatmul(NnFloatType type, NnUint nNodes, NnUint n, NnUint d);
 NnRopeSlice sliceRope(NnRopeType type, NnUint qDim, NnUint kvDim, NnUint nKvHeads, NnUint nNodes, NnUint seqLen, NnUint headDim, float ropeTheta, NnUint nodeIndex);
 NnMultiHeadAttSlice sliceMultiHeadAtt(NnUint nHeads, NnUint seqLen, NnUint nNodes, NnUint nBatches);
+
+// MoE slicing functions
+
+/**
+ * Creates expert weight slicing configuration for distributed MoE computation.
+ * Distributes experts evenly across nodes for load balancing.
+ * 
+ * @param type Weight quantization type (Q40, F32, etc.)
+ * @param nNodes Number of nodes in cluster (must be power of 2)
+ * @param nExperts Total number of experts (e.g., 128)
+ * @param hiddenDim Expert hidden dimension (e.g., 768)
+ * @param dim Model dimension (e.g., 2048)
+ * @param nodeIndex Index of current node (0 to nNodes-1)
+ * @return MoE expert slice configuration for the specified node
+ */
+NnMoeExpertSlice sliceMoeExperts(NnFloatType type, NnUint nNodes, NnUint nExperts, 
+                                NnUint hiddenDim, NnUint dim, NnUint nodeIndex);
 
 // splitters
 

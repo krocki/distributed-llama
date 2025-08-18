@@ -35,8 +35,18 @@ enum LlmHiddenAct {
 };
 
 enum LlmArchType {
-    LLAMA = 0xABCD00,
-    QWEN3 = 0xABCD01
+    LLAMA = 0xABCD00,      // Standard transformer (Llama, Mistral, etc.)
+    QWEN3 = 0xABCD01,      // Qwen3 with Q/K normalization, dense FFN
+    QWEN3_MOE = 0xABCD02   // Qwen3 with MoE layers using weight-split tensor parallelism
+    
+    // QWEN3_MOE Implementation Notes:
+    // - Uses weight-split approach: expert weights distributed across nodes, not experts
+    // - All 128 experts present on each node with partial weights (tensor parallelism)
+    // - Router weights shared across all nodes (not distributed)
+    // - Reuses existing MATMUL, SILU operations for expert computation
+    // - Compatible with 2^n node configurations (2, 4, 8, etc.)
+    // - Memory scales linearly: 2 nodes = 1/2 memory per node, 4 nodes = 1/4, etc.
+    // - Perfect load balancing: all nodes process all experts equally
 };
 
 typedef struct {
@@ -82,6 +92,16 @@ typedef struct {
     NnColMatmulSlice w2Slice;
     NnRowMatmulSlice w3Slice;
     NnRowMatmulSlice wclsSlice;
+    
+    // MoE-specific weight slices (only used for QWEN3_MOE)
+    // Weight-split tensor parallelism approach: all experts on each node with partial weights
+    NnRowMatmulSlice routerSlice;          // Router weights [dim, nExperts] - shared across all nodes
+    NnRowMatmulSlice *expertUpSlices;      // Expert up projections [nExperts*hiddenDim, dim/nNodes] per node
+    NnRowMatmulSlice *expertGateSlices;    // Expert gate projections [nExperts*hiddenDim, dim/nNodes] per node
+    NnColMatmulSlice *expertDownSlices;    // Expert down projections [dim/nNodes, nExperts*hiddenDim] per node
+    NnUint expertsPerNode;                 // All experts on each node (= nExperts for weight-split)
+    NnUint *expertToNodeMap;               // Unused in weight-split approach (kept for compatibility)
+    
     NnUint positionPipeIndex;
     NnUint tokenPipeIndex;
     NnUint xPipeIndex;

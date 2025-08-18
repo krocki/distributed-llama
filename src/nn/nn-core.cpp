@@ -82,6 +82,12 @@ const char *opCodeToString(NnOpCode code) {
     if (code == OP_SILU) return "SILU";
     if (code == OP_MUL) return "MUL";
     if (code == OP_CAST) return "CAST";
+    if (code == OP_SHIFT) return "SHIFT";
+    // Mixture of Experts operations
+    if (code == OP_MOE_ROUTER) return "MOE_ROUTER";
+    if (code == OP_MOE_TOPK) return "MOE_TOPK";
+    if (code == OP_MOE_EXPERT_FFN) return "MOE_EXPERT_FFN";
+    if (code == OP_MOE_COMBINE) return "MOE_COMBINE";
     throw std::invalid_argument("Unknown op code");
 }
 
@@ -268,6 +274,43 @@ NnMultiHeadAttSlice sliceMultiHeadAtt(NnUint nHeads, NnUint seqLen, NnUint nNode
     s.nHeads = nHeads;
     s.nHeads0 = nHeads / nNodes;
     s.attSize = size2D(F_32, nBatches, s.nHeads0 * seqLen);
+    return s;
+}
+
+/**
+ * Creates MoE expert weight slicing configuration for distributed computation.
+ * Distributes experts evenly across nodes to balance computational load.
+ * 
+ * For example, with 128 experts and 4 nodes:
+ * - Node 0: experts 0-31
+ * - Node 1: experts 32-63  
+ * - Node 2: experts 64-95
+ * - Node 3: experts 96-127
+ */
+NnMoeExpertSlice sliceMoeExperts(NnFloatType type, NnUint nNodes, NnUint nExperts, 
+                                NnUint hiddenDim, NnUint dim, NnUint nodeIndex) {
+    NnMoeExpertSlice s;
+    
+    // Ensure experts distribute evenly across nodes
+    assert(nExperts % nNodes == 0);
+    assert(nodeIndex < nNodes);
+    
+    s.type = type;
+    s.nNodes = nNodes;
+    s.nExperts = nExperts;
+    s.expertsPerNode = nExperts / nNodes;
+    s.hiddenDim = hiddenDim;
+    s.dim = dim;
+    
+    // Calculate expert range for this node
+    s.nodeExpertOffset = nodeIndex * s.expertsPerNode;
+    
+    // Total size for all experts: [nExperts * hiddenDim, dim]
+    s.totalSize = size2D(type, nExperts * hiddenDim, dim);
+    
+    // Per-node size for assigned experts: [expertsPerNode * hiddenDim, dim]  
+    s.nodeSize = size2D(type, s.expertsPerNode * hiddenDim, dim);
+    
     return s;
 }
 
