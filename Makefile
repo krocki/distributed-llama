@@ -42,6 +42,8 @@ endif
 clean:
 	$(DELETE_CMD) *.o dllama dllama-* socket-benchmark mmap-buffer-* *-test *.exe
 
+all: nn-moe-test nn-moe-weight-test nn-moe-real-weight-test dllama
+
 # nn
 nn-quants.o: src/nn/nn-quants.cpp
 	$(CXX) $(CXXFLAGS) -c $^ -o $@
@@ -60,6 +62,12 @@ nn-cpu.o: src/nn/nn-cpu.cpp
 nn-cpu-test: src/nn/nn-cpu-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
 nn-cpu-ops-test: src/nn/nn-cpu-ops-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-moe-test: src/nn/nn-moe-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-moe-weight-test: src/nn/nn-moe-weight-test.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o tokenizer.o llm.o app.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-moe-real-weight-test: src/nn/nn-moe-real-weight-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu.o
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
 nn-vulkan.o: src/nn/nn-vulkan.cpp
 	$(CXX) $(CXXFLAGS) -c $^ -o $@

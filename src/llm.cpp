@@ -434,58 +434,48 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
             }
 
             if (h->archType == QWEN3_MOE && h->nExperts > 0) {
-                // ==== MoE COMPUTATION ====
-                // Add MoE-specific buffers
-                const NnUint routerLogitsBufferIndex = nodeBuilder.addBuffer("router_logits", 
-                    size2D(F_32, nBatches, h->nExperts));
-                const NnUint expertIndicesBufferIndex = nodeBuilder.addBuffer("expert_indices", 
-                    size2D(F_32, nBatches, h->nActiveExperts));  // Using F_32 to store indices as floats
-                const NnUint expertWeightsBufferIndex = nodeBuilder.addBuffer("expert_weights", 
-                    size2D(F_32, nBatches, h->nActiveExperts));
-                const NnUint expertOutputsBufferIndex = nodeBuilder.addBuffer("expert_outputs", 
-                    size2D(F_32, nBatches, h->nActiveExperts * h->dim));
-
-                // 1. Router computation: input -> expert logits
+                // ==== SIMPLIFIED MoE: USE STANDARD FFN (EXPERT 0) ====
+                // For development: treat MoE layer as regular FFN using expert 0 weights
+                printf("🔀 MoE simplified mode: using standard FFN computation\n");
+                
                 ff.addOp(
-                    OP_MOE_ROUTER, "moe_router", layerIndex,
+                    OP_MATMUL, "block_matmul_w1", layerIndex,
                     pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
-                    pointerBatchConfig(SRC_BUFFER, routerLogitsBufferIndex),
-                    size2D(F_32, h->dim, h->nExperts),  // Router weight matrix [dim, nExperts]
-                    NnMoeRouterOpConfig{h->nExperts, 0, routerLogitsBufferIndex});
-
-                // 2. Top-k expert selection: logits -> expert indices + weights
+                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                    size2D(h->weightType, n.w1Slice.n, n.w1Slice.d0),
+                    NnMatmulOpConfig{});
                 ff.addOp(
-                    OP_MOE_TOPK, "moe_topk", layerIndex,
-                    pointerBatchConfig(SRC_BUFFER, routerLogitsBufferIndex),
-                    pointerBatchConfig(SRC_BUFFER, expertIndicesBufferIndex),
+                    OP_MATMUL, "block_matmul_w3", layerIndex,
+                    pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, lBufferIndex),
+                    size2D(h->weightType, n.w3Slice.n, n.w3Slice.d0),
+                    NnMatmulOpConfig{});
+                ff.addOp(
+                    OP_SILU, "block_act", layerIndex,
+                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
                     size0(),
-                    NnMoeTopKOpConfig{h->nExperts, h->nActiveExperts, routerLogitsBufferIndex, 
-                                      expertIndicesBufferIndex, expertWeightsBufferIndex});
-
-                // 3. Expert FFN computation: input + expert_id -> expert output
-                // Use existing MATMUL operations with expert weights (reusing existing logic)
-                const NnUint expertUpBufferIndex = nodeBuilder.addBuffer("expert_up", 
-                    size2D(F_32, nBatches, h->nActiveExperts * n.expertUpSlices[nodeIndex].d0));
-                const NnUint expertGateBufferIndex = nodeBuilder.addBuffer("expert_gate", 
-                    size2D(F_32, nBatches, h->nActiveExperts * n.expertGateSlices[nodeIndex].d0));
-
+                    NnSiluOpCodeConfig{});
                 ff.addOp(
-                    OP_MOE_EXPERT_FFN, "moe_expert_ffn", layerIndex,
-                    pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
-                    pointerBatchConfig(SRC_BUFFER, expertOutputsBufferIndex),
-                    size0(),  // Weight size computed dynamically in the operation
-                    NnMoeExpertFFNOpConfig{h->nActiveExperts, h->hiddenDim, expertIndicesBufferIndex,
-                                           expertWeightsBufferIndex, expertOutputsBufferIndex,
-                                           expertUpBufferIndex, expertGateBufferIndex});
-
-                // 4. Combine expert outputs: expert outputs + weights -> final output
+                    OP_MUL, "block_mul", layerIndex,
+                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                    size0(),
+                    NnMulOpCodeConfig{lBufferIndex});
+                if (dBufferIndex != dqBufferIndex) {
+                    ff.addOp(
+                        OP_CAST, "block_cast_d2", layerIndex,
+                        pointerBatchConfig(SRC_BUFFER, dBufferIndex),
+                        pointerBatchConfig(SRC_BUFFER, dqBufferIndex),
+                        size0(),
+                        NnCastOpCodeConfig{});
+                }
                 ff.addOp(
-                    OP_MOE_COMBINE, "moe_combine", layerIndex,
-                    pointerBatchConfig(SRC_BUFFER, expertOutputsBufferIndex),
+                    OP_MATMUL, "block_matmul_w2", layerIndex,
+                    pointerBatchConfig(SRC_BUFFER, dqBufferIndex),
                     pointerBatchConfig(SRC_BUFFER, yBufferIndex),
-                    size0(),
-                    NnMoeCombineOpConfig{h->nActiveExperts, expertOutputsBufferIndex, 
-                                         expertWeightsBufferIndex, 0});
+                    size2D(h->weightType, n.w2Slice.n0, n.w2Slice.d),
+                    NnMatmulOpConfig{});
             } else {
                 // ==== STANDARD FFN COMPUTATION ====
                 ff.addOp(
@@ -630,27 +620,23 @@ void loadLlmNetWeight(const char *path, LlmNet *net, NnRootWeightLoader *loader)
         b += loader->loadColMatmulSlices("block_matmul_wo", layerIndex, &net->woSlice, b);
         
         if (net->header->archType == QWEN3_MOE && net->header->nExperts > 0) {
-            // ==== MoE WEIGHT LOADING WITH TENSOR PARALLELISM ====
-            // Skip standard FFN weights (expert 0 is loaded with all experts in the MoE section)
-            NnUint ffnWeightSize = net->header->hiddenDim * net->header->dim;
-            NnUint bytesPerWeight = getBytes(net->header->weightType, 1);
-            b += ffnWeightSize * bytesPerWeight * 3;  // Skip w1, w2, w3 (expert 0 weights)
+            // ==== SIMPLIFIED MoE: USE FIRST EXPERT AS REGULAR FFN ====
+            // For now, load and use expert 0 weights as regular FFN weights to get basic inference working
+            // TODO: Implement full MoE expert selection and routing
             
-            // Load router weights (F32, shared across all nodes)
-            b += loader->loadAll("moe_router", layerIndex, net->routerSlice.size.nBytes, b);
+            printf("🔀 MoE simplified mode: using expert 0 as regular FFN (development mode)\n");
             
-            // Load expert weights using standard tensor parallelism (reusing existing logic)
-            // Expert up weights: [nExperts * hiddenDim, dim] - split by columns like w1
-            b += loader->loadRowMatmulSlices("moe_expert_up", layerIndex, &net->expertUpSlices[0], b);
+            // Load expert 0 weights as if they were regular FFN weights
+            // The converter stores expert weights, so we load expert 0's weights into the regular FFN slots
+            b += loader->loadRowMatmulSlices("block_matmul_w1", layerIndex, &net->w1Slice, b);  // expert 0 up_proj
+            b += loader->loadRowMatmulSlices("block_matmul_w3", layerIndex, &net->w3Slice, b);  // expert 0 gate_proj  
+            b += loader->loadColMatmulSlices("block_matmul_w2", layerIndex, &net->w2Slice, b);  // expert 0 down_proj
             
-            // Expert gate weights: [nExperts * hiddenDim, dim] - split by columns like w3  
-            b += loader->loadRowMatmulSlices("moe_expert_gate", layerIndex, &net->expertGateSlices[0], b);
+            // Skip all other expert weights for now
+            NnUint expertWeightSize = net->header->hiddenDim * net->header->dim;
+            NnUint bytesPerExpertWeight = getBytes(net->header->weightType, expertWeightSize);
+            b += bytesPerExpertWeight * 3 * (net->header->nExperts - 1);  // Skip remaining 127 experts
             
-            // Expert down weights: [dim, nExperts * hiddenDim] - split by rows like w2
-            b += loader->loadColMatmulSlices("moe_expert_down", layerIndex, &net->expertDownSlices[0], b);
-            
-            printf("🔀 MoE weights loaded: router + %u experts with tensor parallelism (%u nodes)\n", 
-                   net->header->nExperts, net->netConfig.nNodes);
         } else {
             // Standard FFN weights for dense models (LLAMA, QWEN3)
             b += loader->loadRowMatmulSlices("block_matmul_w1", layerIndex, &net->w1Slice, b);
