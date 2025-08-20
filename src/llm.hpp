@@ -4,6 +4,7 @@
 #include "nn/nn-core.hpp"
 #include "nn/nn-executor.hpp"
 #include "nn/nn-network.hpp"
+#include "nn/nn-config-builder.hpp"
 
 enum LlmHeaderKey {
     VERSION = 0,
@@ -96,5 +97,20 @@ void printLlmHeader(LlmHeader *header);
 LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches);
 void releaseLlmNet(LlmNet *net);
 void loadLlmNetWeight(const char* path, LlmNet *net, NnRootWeightLoader *loader);
+
+// MOE segment builders (for testing)
+void buildFfnSegment(NnSegmentConfigBuilder& ff, LlmHeader* h, NnUint layerIndex,
+                    NnUint yBufferIndex, NnUint yqBufferIndex, NnUint dBufferIndex,
+                    NnUint dqBufferIndex, NnUint lBufferIndex, 
+                    NnRowMatmulSlice& w1Slice, NnColMatmulSlice& w2Slice, NnRowMatmulSlice& w3Slice);
+
+void buildMoeSegment(NnSegmentConfigBuilder& ff, LlmHeader* h, NnUint layerIndex,
+                    NnUint yBufferIndex, NnUint yqBufferIndex, NnUint expertInputBufferIndex,
+                    NnUint expertIndicesBufferIndex, NnUint routingWeightsBufferIndex,
+                    NnUint expertOutputsBufferIndex, NnUint weightVectorBufferIndex,
+                    NnUint* dBufferIndices, NnUint* dqBufferIndices, NnUint* lBufferIndices,
+                    NnRowMatmulSlice& routerSlice,
+                    NnRowMatmulSlice* expertW1Slices, NnColMatmulSlice* expertW2Slices, 
+                    NnRowMatmulSlice* expertW3Slices);
 
 #endif

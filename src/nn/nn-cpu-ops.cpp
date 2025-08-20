@@ -1325,6 +1325,114 @@ static void shiftForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint bat
     }
 }
 
+static void routerForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
+    ASSERT_EQ(context->inputSize.floatType, F_32);
+    ASSERT_EQ(context->outputSize.floatType, F_32);
+    
+    const NnRouterOpConfig *config = (NnRouterOpConfig *)context->opConfig;
+    const float *routerWeight = (float *)context->weight;
+    float *expertIndicesBuffer = (float *)context->buffers[config->expertIndicesBufferIndex];
+    float *routingWeightsBuffer = (float *)context->buffers[config->routingWeightsBufferIndex];
+    
+    for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
+        float *input = (float *)context->input[batchIndex];
+        float *output = (float *)context->output[batchIndex];
+        float *expertIndices = &expertIndicesBuffer[batchIndex * config->nActiveExperts];
+        float *routingWeights = &routingWeightsBuffer[batchIndex * config->nActiveExperts];
+        
+        // Router matmul: input -> logits
+        float *logits = output; // Reuse output buffer for logits
+        matmul_F32_F32_F32(
+            logits,
+            input,
+            routerWeight,
+            config->routerWeightSize.y, // nExperts
+            config->routerWeightSize.x, // input_dim
+            nThreads,
+            threadIndex);
+        
+        // Create pairs of (logit_value, expert_index) for top-k selection
+        struct ExpertLogit {
+            float logit;
+            NnUint expertIdx;
+        };
+        
+        // Use dynamic allocation for C++11 compatibility
+        ExpertLogit *expertLogits = new ExpertLogit[config->nExperts];
+        
+        for (NnUint i = 0; i < config->nExperts; i++) {
+            expertLogits[i].logit = logits[i];
+            expertLogits[i].expertIdx = i;
+        }
+        
+        // Find top-k experts using selection sort
+        for (NnUint k = 0; k < config->nActiveExperts; k++) {
+            NnUint maxIdx = k;
+            for (NnUint i = k + 1; i < config->nExperts; i++) {
+                if (expertLogits[i].logit > expertLogits[maxIdx].logit) {
+                    maxIdx = i;
+                }
+            }
+            // Swap the expert-logit pairs
+            if (maxIdx != k) {
+                ExpertLogit temp = expertLogits[k];
+                expertLogits[k] = expertLogits[maxIdx];
+                expertLogits[maxIdx] = temp;
+            }
+            expertIndices[k] = expertLogits[k].expertIdx;
+        }
+        
+        // Softmax on selected experts' logits to get routing weights
+        float maxLogit = expertLogits[0].logit;
+        for (NnUint k = 1; k < config->nActiveExperts; k++) {
+            if (expertLogits[k].logit > maxLogit) maxLogit = expertLogits[k].logit;
+        }
+        
+        float sumExp = 0.0f;
+        for (NnUint k = 0; k < config->nActiveExperts; k++) {
+            routingWeights[k] = expf(expertLogits[k].logit - maxLogit);
+            sumExp += routingWeights[k];
+        }
+        
+        for (NnUint k = 0; k < config->nActiveExperts; k++) {
+            routingWeights[k] /= sumExp;
+        }
+        
+        delete[] expertLogits;
+    }
+}
+
+static void moeMergeForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
+    ASSERT_EQ(context->inputSize.floatType, F_32);
+    ASSERT_EQ(context->outputSize.floatType, F_32);
+    
+    const NnMoeMergeOpConfig *config = (NnMoeMergeOpConfig *)context->opConfig;
+    const float *routingWeightsBuffer = (float *)context->buffers[config->routingWeightsBufferIndex];
+    const float *expertOutputsBuffer = (float *)context->buffers[config->expertOutputsBufferIndex];
+    
+    for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
+        float *output = (float *)context->output[batchIndex];
+        const float *routingWeights = &routingWeightsBuffer[batchIndex * config->nActiveExperts];
+        const float *expertOutputs = &expertOutputsBuffer[batchIndex * config->nActiveExperts * context->outputSize.x];
+        
+        // Initialize output to zero
+        for (NnUint i = 0; i < context->outputSize.x; i++) {
+            output[i] = 0.0f;
+        }
+        
+        // Weighted sum of expert outputs
+        for (NnUint k = 0; k < config->nActiveExperts; k++) {
+            float weight = routingWeights[k];
+            const float *expertOutput = &expertOutputs[k * context->outputSize.x];
+            
+            for (NnUint i = 0; i < context->outputSize.x; i++) {
+                output[i] += weight * expertOutput[i];
+            }
+        }
+    }
+}
+
+
 // device
 
 void printCpuInstructionSet() {
@@ -1409,6 +1517,12 @@ NnCpuOpForward getCpuOpForward(NnOpCode code, NnOpQuantType quantType) {
     }
     if (code == OP_SHIFT) {
         if (quantType == F32_F32_F32) return shiftForward_F32_F32;
+    }
+    if (code == OP_ROUTER) {
+        if (quantType == F32_F32_F32) return routerForward_F32_F32;
+    }
+    if (code == OP_MOE_MERGE) {
+        if (quantType == F32_F32_F32) return moeMergeForward_F32_F32;
     }
     return nullptr;
 }

@@ -82,6 +82,9 @@ const char *opCodeToString(NnOpCode code) {
     if (code == OP_SILU) return "SILU";
     if (code == OP_MUL) return "MUL";
     if (code == OP_CAST) return "CAST";
+    if (code == OP_SHIFT) return "SHIFT";
+    if (code == OP_ROUTER) return "ROUTER";
+    if (code == OP_MOE_MERGE) return "MOE_MERGE";
     throw std::invalid_argument("Unknown op code");
 }
 

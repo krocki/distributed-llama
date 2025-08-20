@@ -81,6 +81,8 @@ enum NnOpCode {
     OP_MUL,
     OP_CAST,
     OP_SHIFT,
+    OP_ROUTER,
+    OP_MOE_MERGE,
 };
 
 enum NnOpQuantType {
@@ -95,7 +97,7 @@ enum NnOpQuantType {
     Q80_F32_F32,
 };
 
-#define N_OP_CODES (OP_SHIFT + 1)
+#define N_OP_CODES (OP_MOE_MERGE + 1)
 #define N_OP_QUANTS (Q80_F32_F32 + 1)
 
 enum NnPointerSource {
@@ -249,6 +251,21 @@ typedef struct {
 typedef struct {
     NnUint indexPipeIndex;
 } NnShiftOpCodeConfig;
+
+typedef struct {
+    NnUint nExperts;
+    NnUint nActiveExperts;
+    NnUint expertIndicesBufferIndex;
+    NnUint routingWeightsBufferIndex;
+    NnSize2D routerWeightSize;
+} NnRouterOpConfig;
+
+typedef struct {
+    NnUint nActiveExperts;
+    NnUint expertIndicesBufferIndex;
+    NnUint routingWeightsBufferIndex;
+    NnUint expertOutputsBufferIndex;
+} NnMoeMergeOpConfig;
 
 // utility functions
 

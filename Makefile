@@ -1,15 +1,15 @@
 CXX = g++
-CXXFLAGS = -std=c++11 -Werror -Wformat -Werror=format-security 
+CXXFLAGS = -g -std=c++11 -Werror -Wformat -Werror=format-security 
 
 ifndef TERMUX_VERSION
 	CXXFLAGS += -march=native -mtune=native
 endif
 
-ifdef DEBUG
+#ifdef DEBUG
 	CXXFLAGS += -g -fsanitize=address
-else
-	CXXFLAGS += -O3
-endif
+#else
+#	CXXFLAGS += -O3
+#endif
 
 ifdef WVLA
 	CXXFLAGS += -Wvla-extension
@@ -60,6 +60,38 @@ nn-cpu.o: src/nn/nn-cpu.cpp
 nn-cpu-test: src/nn/nn-cpu-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
 nn-cpu-ops-test: src/nn/nn-cpu-ops-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-moe-test: src/nn/nn-moe-test.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-simple-test: src/nn/nn-simple-test.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-moe-simple-test: src/nn/nn-moe-simple-test.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-moe-minimal-test: src/nn/nn-moe-minimal-test.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-basic-test: src/nn/nn-basic-test.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-minimal-crash: src/nn/nn-minimal-crash.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-moe-pipeline-test: src/nn/nn-moe-pipeline-test.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-router-ffn-test: src/nn/nn-router-ffn-test.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-incremental-moe-test: src/nn/nn-incremental-moe-test.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-manual-ffn-test: src/nn/nn-manual-ffn-test.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-working-integration: src/nn/nn-working-integration.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-simple-router-ffn: src/nn/nn-simple-router-ffn.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-moe-final-test: src/nn/nn-moe-final-test.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-manual-moe-working: src/nn/nn-manual-moe-working.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-test-buildmoe: src/nn/nn-test-buildmoe.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-expert-selection-test: src/nn/nn-expert-selection-test.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
 nn-vulkan.o: src/nn/nn-vulkan.cpp
 	$(CXX) $(CXXFLAGS) -c $^ -o $@
