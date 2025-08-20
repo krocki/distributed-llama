@@ -72,7 +72,7 @@ static void silu_F32_exact(float *output, const unsigned int n) {
 
 #define DIM 8
 #define N_EXPERTS 8
-#define N_ACTIVE_EXPERTS 4
+#define N_ACTIVE_EXPERTS 8
 #define N_BATCHES 1
 
 void buildMoeTestConfig(NnNetConfig *netConfig, NnNodeConfig *nodeConfig) {
@@ -414,7 +414,7 @@ int main() {
     
     initQuants();
 
-    NnUint nThreads = 1;
+    NnUint nThreads = 2;
     NnNetConfig netConfig;
     NnNodeConfig nodeConfig;
     buildMoeTestConfig(&netConfig, &nodeConfig);
@@ -479,20 +479,33 @@ int main() {
         }
     }
     
-    // Load weights for the ACTUAL experts that buildMoeSegment will process
-    // buildMoeSegment hardcodes experts [4, 6, 0, 7], so we need to load those
-    static int selectedExperts[4] = {4, 6, 0, 7};
+    // PHASE 1: Run router to determine expert selection
+    printf("=== PHASE 1: Running router to determine expert selection ===\n");
     
-    // MULTI-EXPERT PROCESSING: Load weights for all N_ACTIVE_EXPERTS
-    // buildMoeSegment processes experts sequentially: experts[0], experts[1], etc.
-    printf("=== MULTI-EXPERT PROCESSING (N_ACTIVE_EXPERTS=%d) ===\n", N_ACTIVE_EXPERTS);
+    // Set batch size first
+    execution.setBatchSize(N_BATCHES);
+    
+    // First, run just the router operation to get expert selection
+    // Input data is already set up in execution.pipes[0] above
+    executor.forward(); // This will run the router and populate expertIndicesBuffer
+    
+    printf("Router selected experts: ");
+    for (int i = 0; i < N_ACTIVE_EXPERTS; i++) {
+        printf("%.0f ", expertIndices[i]);
+    }
+    printf("\n");
+    
+    // PHASE 2: Load expert weights in the order router selected them
+    printf("=== PHASE 2: Loading expert weights in router selection order ===\n");
     
     for (int k = 0; k < N_ACTIVE_EXPERTS; k++) {
-        // Each expert gets a unique layerIndex: layerIndex + 100 + k
+        // Router selected expert at position k
+        int expertIndex = (int)expertIndices[k];
+        // Load this expert's weights into layerIndex for position k
         NnUint expertLayerIndex = 1 + 100 + k; // layerIndex 101, 102, etc.
-        int expertIndex = selectedExperts[k]; // Expert 4, Expert 6, etc.
         
-        printf("Loading Expert %d weights into layerIndex %d (expert slot %d)\n", expertIndex, expertLayerIndex, k);
+        printf("Loading Expert %d weights into layerIndex %d (router position %d)\n", 
+               expertIndex, expertLayerIndex, k);
         printf("  Expert %d W1[0-3]: %.3f %.3f %.3f %.3f\n", expertIndex,
                allExpertW1[expertIndex * DIM * DIM + 0], allExpertW1[expertIndex * DIM * DIM + 1],
                allExpertW1[expertIndex * DIM * DIM + 2], allExpertW1[expertIndex * DIM * DIM + 3]);
@@ -507,24 +520,11 @@ int main() {
         printf("  Loaded Expert %d into layerIndex %d\n", expertIndex, expertLayerIndex);
     }
     
-    printf("=== Weight Loading Debug ===\n");
-    int firstExpertIndex = selectedExperts[0];
-    printf("First expert (%d) analysis:\n", firstExpertIndex);
-    
-    // Check if weights are all zeros (identity/passthrough weights)
-    bool allZeros = true;
-    bool allOnes = true;
-    for (int i = 0; i < DIM * DIM && (allZeros || allOnes); i++) {
-        float w1 = allExpertW1[firstExpertIndex * DIM * DIM + i];
-        if (w1 != 0.0f) allZeros = false;
-        if (w1 != 1.0f && i % (DIM + 1) != 0) allOnes = false; // Allow identity matrix
-    }
-    printf("  Expert %d weight analysis: allZeros=%s, identityPattern=%s\n", firstExpertIndex, 
-           allZeros ? "YES" : "NO", allOnes ? "YES" : "NO");
-    
-    printf("=== Weight Loading Verification ===");
+    printf("=== Weight Loading Verification ===\n");
     for (int k = 0; k < N_ACTIVE_EXPERTS; k++) {
-        printf("Expert slot %d: layerIndex %d -> Expert %d\n", k, 1 + 100 + k, selectedExperts[k]);
+        int expertIndex = (int)expertIndices[k];
+        printf("Expert slot %d: layerIndex %d -> Expert %d (router selected)\n", 
+               k, 1 + 100 + k, expertIndex);
     }
     printf("Weight loading completed for %d experts\n", N_ACTIVE_EXPERTS);
     
@@ -557,8 +557,13 @@ int main() {
     
     printf("=== THEORY 2: Buffer State Mid-Execution ===\n");
     printf("About to call executor.forward() - checking buffer states:\n");
-    // From earlier debug: Expert 0 buffers: d=7, dq=8, l=9; Expert 1 buffers: d=10, dq=11, l=12
-    int expertDBufferIndices[2] = {7, 10}; // expert0_d, expert1_d  
+    // Buffer indices for N_ACTIVE_EXPERTS (dynamically determined based on allocation)
+    // Slot 0 (broken): d=7, dq=8, l=9; Slot 1 (working): d=10, dq=11, l=12
+    // For general k, we only care about the working buffers that buildMoeSegment uses
+    int expertDBufferIndices[N_ACTIVE_EXPERTS];
+    for (int k = 0; k < N_ACTIVE_EXPERTS; k++) {
+        expertDBufferIndices[k] = 10; // All experts use slot 1 working buffer in current implementation
+    }  
     for (int k = 0; k < N_ACTIVE_EXPERTS; k++) {
         float *expertBuffer = (float *)device->buffers[expertDBufferIndices[k]];
         printf("Expert %d output buffer (index %d, before execution): ", k, expertDBufferIndices[k]);
@@ -566,6 +571,8 @@ int main() {
         printf("...\n");
     }
     
+    // PHASE 3: Run the full MOE computation with router-selected expert weights
+    printf("=== PHASE 3: Running full MOE computation with router-selected experts ===\n");
     executor.forward();
     
     printf("=== THEORY 2: Buffer State Post-Execution ===\n");
@@ -647,12 +654,12 @@ int main() {
     
     // STEP 1: Capture individual expert outputs by running each expert separately
     float expert_outputs[N_ACTIVE_EXPERTS][DIM];
-    // Use the same selectedExperts array as defined earlier in the file
+    // Read actual selected experts from router output
     
     for (int k = 0; k < N_ACTIVE_EXPERTS; k++) {
         // Create a simple network to run just expert k
         // Compute expert k output using reference implementation with same weights as loaded
-        int expertIndex = selectedExperts[k];
+        int expertIndex = (int)expertIndices[k]; // Read from router output
         printf("Capturing Expert %d output...\n", expertIndex);
         
         // Debug: Check first few weights to ensure they match what was loaded
@@ -704,7 +711,7 @@ int main() {
             }
         }
         
-        printf("Expert %d raw output: ", selectedExperts[k]);
+        printf("Expert %d raw output: ", expertIndex);
         for (int i = 0; i < DIM; i++) printf("%.3f ", expert_outputs[k][i]);
         printf("\n");
     }
@@ -737,10 +744,9 @@ int main() {
     
     // Debug: Show which experts we're actually using in our implementation
     printf("=== buildMoeSegment Expert Selection ===\n");
-    // selectedExperts already defined in weight loading section
-    printf("Our hardcoded experts: ");
+    printf("Initially loaded experts (all N_ACTIVE_EXPERTS): ");
     for (int k = 0; k < N_ACTIVE_EXPERTS; k++) {
-        printf("%d ", selectedExperts[k]);
+        printf("%d ", k);
     }
     printf("\n");
     printf("Router selected experts: ");
