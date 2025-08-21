@@ -102,13 +102,13 @@ void loadLlmNetWeight(const char* path, LlmNet *net, NnRootWeightLoader *loader)
 void buildFfnSegment(NnSegmentConfigBuilder& ff, LlmHeader* h, NnUint layerIndex,
                     NnUint yBufferIndex, NnUint yqBufferIndex, NnUint dBufferIndex,
                     NnUint dqBufferIndex, NnUint lBufferIndex, 
-                    NnRowMatmulSlice& w1Slice, NnColMatmulSlice& w2Slice, NnRowMatmulSlice& w3Slice);
+                    NnRowMatmulSlice& w1Slice, NnColMatmulSlice& w2Slice, NnRowMatmulSlice& w3Slice, std::string expert_id = "");
 
 void buildMoeSegment(NnSegmentConfigBuilder& ff, LlmHeader* h, NnUint layerIndex,
-                    NnUint yBufferIndex, NnUint yqBufferIndex, NnUint expertInputBufferIndex,
+                    NnUint yBufferIndex, NnUint yqBufferIndex, NnUint routerLogitsBufferIndex,
                     NnUint expertIndicesBufferIndex, NnUint routingWeightsBufferIndex,
-                    NnUint expertOutputsBufferIndex, NnUint weightVectorBufferIndex,
-                    NnUint* dBufferIndices, NnUint* dqBufferIndices, NnUint* lBufferIndices,
+                    NnUint* expertBufferIndices, NnUint* weightVectorBufferIndices,
+                    NnUint* dqBufferIndices, NnUint* lBufferIndices,
                     NnRowMatmulSlice& routerSlice,
                     NnRowMatmulSlice* expertW1Slices, NnColMatmulSlice* expertW2Slices, 
                     NnRowMatmulSlice* expertW3Slices);

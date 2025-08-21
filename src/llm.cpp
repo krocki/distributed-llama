@@ -35,7 +35,8 @@ static float convertNormEpsilon(int value) {
 void buildFfnSegment(NnSegmentConfigBuilder& ff, LlmHeader* h, NnUint layerIndex,
                            NnUint yBufferIndex, NnUint yqBufferIndex, NnUint dBufferIndex,
                            NnUint dqBufferIndex, NnUint lBufferIndex, 
-                           NnRowMatmulSlice& w1Slice, NnColMatmulSlice& w2Slice, NnRowMatmulSlice& w3Slice) {
+                           NnRowMatmulSlice& w1Slice, NnColMatmulSlice& w2Slice, NnRowMatmulSlice& w3Slice,
+                           std::string expert_id) {
     if (yBufferIndex != yqBufferIndex) {
         ff.addOp(
             OP_CAST, "block_cast_y3", layerIndex,
@@ -44,14 +45,18 @@ void buildFfnSegment(NnSegmentConfigBuilder& ff, LlmHeader* h, NnUint layerIndex
             size0(),
             NnCastOpCodeConfig{});
     }
+    std::string w1_str = "block_matmul_w1" + expert_id;
+    std::string w2_str = "block_matmul_w2" + expert_id;
+    std::string w3_str = "block_matmul_w3" + expert_id;
+
     ff.addOp(
-        OP_MATMUL, "block_matmul_w1", layerIndex,
+        OP_MATMUL, w1_str.c_str(), layerIndex,
         pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
         pointerBatchConfig(SRC_BUFFER, dBufferIndex),
         size2D(h->weightType, w1Slice.n, w1Slice.d0),
         NnMatmulOpConfig{});
     ff.addOp(
-        OP_MATMUL, "block_matmul_w3", layerIndex,
+        OP_MATMUL, w3_str.c_str(), layerIndex,
         pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
         pointerBatchConfig(SRC_BUFFER, lBufferIndex),
         size2D(h->weightType, w3Slice.n, w3Slice.d0),
@@ -77,7 +82,7 @@ void buildFfnSegment(NnSegmentConfigBuilder& ff, LlmHeader* h, NnUint layerIndex
             NnCastOpCodeConfig{});
     }
     ff.addOp(
-        OP_MATMUL, "block_matmul_w2", layerIndex,
+        OP_MATMUL, w2_str.c_str(), layerIndex,
         pointerBatchConfig(SRC_BUFFER, dqBufferIndex),
         pointerBatchConfig(SRC_BUFFER, yBufferIndex),
         size2D(h->weightType, w2Slice.n0, w2Slice.d),
@@ -85,60 +90,97 @@ void buildFfnSegment(NnSegmentConfigBuilder& ff, LlmHeader* h, NnUint layerIndex
 }
 
 void buildMoeSegment(NnSegmentConfigBuilder& ff, LlmHeader* h, NnUint layerIndex,
-                           NnUint yBufferIndex, NnUint yqBufferIndex, NnUint expertInputBufferIndex,
+                           NnUint yBufferIndex, NnUint yqBufferIndex, NnUint routerLogitsBufferIndex,
                            NnUint expertIndicesBufferIndex, NnUint routingWeightsBufferIndex,
-                           NnUint expertOutputsBufferIndex, NnUint weightVectorBufferIndex,
-                           NnUint* dBufferIndices, NnUint* dqBufferIndices, NnUint* lBufferIndices,
+                           NnUint* expertBufferIndices, NnUint *weightVectorBufferIndices,
+                           NnUint* dqBufferIndices, NnUint* lBufferIndices,
                            NnRowMatmulSlice& routerSlice,
                            NnRowMatmulSlice* expertW1Slices, NnColMatmulSlice* expertW2Slices, 
                            NnRowMatmulSlice* expertW3Slices) {
-    
-    // Step 1: Router operation - select top-k experts and compute routing weights
-    ff.addOp(
-        OP_ROUTER, "block_router", layerIndex,
-        pointerBatchConfig(SRC_BUFFER, yqBufferIndex),    // Input: input activations
-        pointerBatchConfig(SRC_BUFFER, expertOutputsBufferIndex), // Output: router logits (use dedicated buffer)
-        size2D(h->weightType, routerSlice.n, routerSlice.d0),
-        NnRouterOpConfig{h->nExperts, h->nActiveExperts, expertIndicesBufferIndex, 
-                        routingWeightsBufferIndex, size2D(h->weightType, routerSlice.n, routerSlice.d0)});
-    
-    // Step 2: Use the parallel approach that we know works
-    // Process both experts in parallel, then copy the result from the working expert
-    
-    // SEQUENTIAL EXPERT PROCESSING with router-based expert selection
-    // The challenge: neural network operations are built statically but we need dynamic expert selection
-    // Solution: Process all N_ACTIVE_EXPERTS but load weights according to router selection
-    
-    // Process experts sequentially using slot 1 buffer
-    NnUint workingSlot = 1;  // Always use slot 1 which works (never slot 0)
-    
-    // NOTE: The expert weights must be loaded in the order that router selects them
-    // Test code should load Expert 4 weights into layerIndex 101, Expert 6 into 102, etc.
-    // based on the router selection [4, 6, 0, 7, 2, 1, 5, 3]
+
+    // GENERALIZED MOE: Router + N experts + top-k selection + weighted accumulation
+    // 1. Router computes logits for ALL N experts, selects top-k, computes softmax over top-k
+    // 2. Top-k experts compute their outputs (always process k experts regardless of actual expert IDs)
+    // 3. Weighted sum combines top-k expert outputs using routing weights
+
+    // === ROUTER OPERATION ===
+    // Router: input -> logits for ALL N experts -> top-k selection -> softmax weights over top-k
+    ff.addOp(OP_ROUTER, "block_router", layerIndex,
+             pointerBatchConfig(SRC_BUFFER, yqBufferIndex),           // Input
+             pointerBatchConfig(SRC_BUFFER, routerLogitsBufferIndex), // Router logits output (all N experts)
+             size2D(F_32, routerSlice.n, routerSlice.d0),
+             NnRouterOpConfig{h->nExperts, h->nActiveExperts, 
+                             expertIndicesBufferIndex, routingWeightsBufferIndex,
+                             size2D(h->weightType, routerSlice.n, routerSlice.d0)});
+
+    // === TOP-K EXPERT COMPUTATIONS ===
+    // Process top-k active experts sequentially
+    // We always process exactly k experts, but their weights come from different expert IDs
     
     for (NnUint k = 0; k < h->nActiveExperts; k++) {
-        NnUint expertLayerIndex = layerIndex + 100 + k;
-        // The test code must ensure that weights for the k-th router-selected expert 
-        // are loaded into expertLayerIndex = layerIndex + 100 + k
+        char expertSuffix[8];
+        snprintf(expertSuffix, sizeof(expertSuffix), ".%d", k);
         
-        buildFfnSegment(ff, h, expertLayerIndex,
-                       dBufferIndices[workingSlot], // output: working buffer (same for all)
-                       expertInputBufferIndex,     // input: clean expert input
-                       dqBufferIndices[workingSlot], // work buffer: slot 1
-                       lBufferIndices[workingSlot],  // work buffer: slot 1  
-                       lBufferIndices[workingSlot],  // work buffer: slot 1
-                       expertW1Slices[k], expertW2Slices[k], expertW3Slices[k]);
+        // Expert k W1 matmul: input -> hidden
+        ff.addOp(
+            OP_MATMUL, ("block_matmul_w1" + std::string(expertSuffix)).c_str(), layerIndex,
+            pointerBatchConfig(SRC_BUFFER, yqBufferIndex),                    // Input
+            pointerBatchConfig(SRC_BUFFER, weightVectorBufferIndices[k]),     // Hidden
+            size2D(h->weightType, expertW1Slices[k].n, expertW1Slices[k].d0),
+            NnMatmulOpConfig{});
+
+        // Expert k W3 matmul: input -> gate
+        ff.addOp(
+            OP_MATMUL, ("block_matmul_w3" + std::string(expertSuffix)).c_str(), layerIndex,
+            pointerBatchConfig(SRC_BUFFER, yqBufferIndex),                    // Input
+            pointerBatchConfig(SRC_BUFFER, lBufferIndices[k]),                // Gate
+            size2D(h->weightType, expertW3Slices[k].n, expertW3Slices[k].d0),
+            NnMatmulOpConfig{});
+
+        // Expert k SiLU activation: hidden -> SiLU(hidden) (in-place)
+        ff.addOp(
+            OP_SILU, ("expert" + std::to_string(k) + "_silu").c_str(), layerIndex,
+            pointerBatchConfig(SRC_BUFFER, weightVectorBufferIndices[k]),
+            pointerBatchConfig(SRC_BUFFER, weightVectorBufferIndices[k]),     // in-place
+            size0(),
+            NnSiluOpCodeConfig{});
+
+        // Expert k Element-wise multiply: SiLU(W1) * W3
+        ff.addOp(
+            OP_MUL, ("expert" + std::to_string(k) + "_mul").c_str(), layerIndex,
+            pointerBatchConfig(SRC_BUFFER, weightVectorBufferIndices[k]),
+            pointerBatchConfig(SRC_BUFFER, weightVectorBufferIndices[k]),     // in-place
+            size0(),
+            NnMulOpCodeConfig{lBufferIndices[k]});                            // multiplier buffer
+
+        // Expert k W2 matmul: hidden -> output
+        ff.addOp(
+            OP_MATMUL, ("block_matmul_w2" + std::string(expertSuffix)).c_str(), layerIndex,
+            pointerBatchConfig(SRC_BUFFER, weightVectorBufferIndices[k]),
+            pointerBatchConfig(SRC_BUFFER, expertBufferIndices[k]),           // Expert k output
+            size2D(h->weightType, expertW2Slices[k].n0, expertW2Slices[k].d),
+            NnMatmulOpConfig{});
+    }
+
+    // === GENERALIZED WEIGHTED ACCUMULATION ===
+    // Use OP_WEIGHTED_SUM for any number of experts k >= 1
+    // Computes: output = sum(weight[k] * expert[k]) for k=0..nActiveExperts-1
+    
+    // Copy expert buffer indices into config struct (fixed array)
+    NnWeightedSumOpConfig weightedSumConfig;
+    weightedSumConfig.nActiveExperts = h->nActiveExperts;
+    weightedSumConfig.routingWeightsBufferIndex = routingWeightsBufferIndex;
+    for (NnUint k = 0; k < h->nActiveExperts; k++) {
+        weightedSumConfig.expertBufferIndices[k] = expertBufferIndices[k];
     }
     
-    // Copy final expert result to yBufferIndex for output
+    // Note: We use a dummy input since OP_WEIGHTED_SUM accesses experts via config->expertBufferIndices
     ff.addOp(
-        OP_CAST, "moe_copy_result", layerIndex,
-        pointerBatchConfig(SRC_BUFFER, dBufferIndices[workingSlot]), // Final expert output (working buffer)
-        pointerBatchConfig(SRC_BUFFER, yBufferIndex),               // Final output location
+        OP_WEIGHTED_SUM, "moe_weighted_sum", layerIndex,
+        pointerBatchConfig(SRC_BUFFER, yqBufferIndex),            // Dummy input (not used)
+        pointerBatchConfig(SRC_BUFFER, yBufferIndex),             // Final output
         size0(),
-        NnCastOpCodeConfig{});
-    // Current result in yBufferIndex: unweighted sum of expert outputs
-    // Post-processing will compute: weighted_sum = sum(routingWeights[k] * expertOutput[k])
+        weightedSumConfig);
 }
 
 LlmHeader loadLlmHeader(const char *path, const NnUint maxSeqLen, NnFloatType syncType) {
@@ -504,7 +546,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
             // Dense FFN for regular models  
             buildFfnSegment(ff, h, layerIndex, yBufferIndex, yqBufferIndex, 
                            dBufferIndex, dqBufferIndex, lBufferIndex,
-                           n.w1Slice, n.w2Slice, n.w3Slice);
+                           n.w1Slice, n.w2Slice, n.w3Slice, "");
             
             ff.addOp(
                 OP_CAST, "block_cast_d3", layerIndex,

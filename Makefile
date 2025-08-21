@@ -91,6 +91,15 @@ nn-manual-moe-working: src/nn/nn-manual-moe-working.cpp nn-quants.o nn-core.o nn
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
 nn-test-buildmoe: src/nn/nn-test-buildmoe.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+
+nn-test-moe-clean: src/nn/nn-test-moe-clean.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+
+nn-test-ffn: src/nn/nn-test-ffn.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+
+nn-test-moe-simple: src/nn/nn-test-moe-simple.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
 nn-expert-selection-test: src/nn/nn-expert-selection-test.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
 nn-vulkan.o: src/nn/nn-vulkan.cpp

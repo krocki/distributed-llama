@@ -1334,7 +1334,10 @@ static void routerForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint ba
     float *expertIndicesBuffer = (float *)context->buffers[config->expertIndicesBufferIndex];
     float *routingWeightsBuffer = (float *)context->buffers[config->routingWeightsBufferIndex];
     
-    for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
+    // Split batches across threads for thread safety
+    SPLIT_THREADS(batchStart, batchEnd, batchSize, nThreads, threadIndex);
+    
+    for (NnUint batchIndex = batchStart; batchIndex < batchEnd; batchIndex++) {
         float *input = (float *)context->input[batchIndex];
         float *output = (float *)context->output[batchIndex];
         float *expertIndices = &expertIndicesBuffer[batchIndex * config->nActiveExperts];
@@ -1402,31 +1405,34 @@ static void routerForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint ba
     }
 }
 
-static void moeMergeForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
+
+static void weightedSumForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
     ASSERT_EQ(context->inputSize.floatType, F_32);
     ASSERT_EQ(context->outputSize.floatType, F_32);
     
-    const NnMoeMergeOpConfig *config = (NnMoeMergeOpConfig *)context->opConfig;
+    const NnWeightedSumOpConfig *config = (NnWeightedSumOpConfig *)context->opConfig;
     const float *routingWeightsBuffer = (float *)context->buffers[config->routingWeightsBufferIndex];
-    const float *expertOutputsBuffer = (float *)context->buffers[config->expertOutputsBufferIndex];
     
-    for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
-        float *output = (float *)context->output[batchIndex];
+    // Split batches across threads for thread safety
+    SPLIT_THREADS(batchStart, batchEnd, batchSize, nThreads, threadIndex);
+    
+    for (NnUint batchIndex = batchStart; batchIndex < batchEnd; batchIndex++) {
+        float *output = (float *)context->output[batchIndex];   // Final output
         const float *routingWeights = &routingWeightsBuffer[batchIndex * config->nActiveExperts];
-        const float *expertOutputs = &expertOutputsBuffer[batchIndex * config->nActiveExperts * context->outputSize.x];
         
         // Initialize output to zero
         for (NnUint i = 0; i < context->outputSize.x; i++) {
             output[i] = 0.0f;
         }
         
-        // Weighted sum of expert outputs
+        // Compute weighted sum: output = sum(weight[k] * expert[k]) for k=0..nActiveExperts-1
         for (NnUint k = 0; k < config->nActiveExperts; k++) {
+            const float *expertBuffer = (float *)context->buffers[config->expertBufferIndices[k]];
+            const float *expert = &expertBuffer[batchIndex * context->outputSize.x];
             float weight = routingWeights[k];
-            const float *expertOutput = &expertOutputs[k * context->outputSize.x];
             
             for (NnUint i = 0; i < context->outputSize.x; i++) {
-                output[i] += weight * expertOutput[i];
+                output[i] += weight * expert[i];
             }
         }
     }
@@ -1521,8 +1527,8 @@ NnCpuOpForward getCpuOpForward(NnOpCode code, NnOpQuantType quantType) {
     if (code == OP_ROUTER) {
         if (quantType == F32_F32_F32) return routerForward_F32_F32;
     }
-    if (code == OP_MOE_MERGE) {
-        if (quantType == F32_F32_F32) return moeMergeForward_F32_F32;
+    if (code == OP_WEIGHTED_SUM) {
+        if (quantType == F32_F32_F32) return weightedSumForward_F32_F32;
     }
     return nullptr;
 }

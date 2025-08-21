@@ -82,7 +82,7 @@ enum NnOpCode {
     OP_CAST,
     OP_SHIFT,
     OP_ROUTER,
-    OP_MOE_MERGE,
+    OP_WEIGHTED_SUM,
 };
 
 enum NnOpQuantType {
@@ -97,7 +97,7 @@ enum NnOpQuantType {
     Q80_F32_F32,
 };
 
-#define N_OP_CODES (OP_MOE_MERGE + 1)
+#define N_OP_CODES (OP_WEIGHTED_SUM + 1)
 #define N_OP_QUANTS (Q80_F32_F32 + 1)
 
 enum NnPointerSource {
@@ -262,10 +262,9 @@ typedef struct {
 
 typedef struct {
     NnUint nActiveExperts;
-    NnUint expertIndicesBufferIndex;
+    NnUint expertBufferIndices[8];  // Fixed array for up to 8 experts (adjust as needed)
     NnUint routingWeightsBufferIndex;
-    NnUint expertOutputsBufferIndex;
-} NnMoeMergeOpConfig;
+} NnWeightedSumOpConfig;
 
 // utility functions
 
