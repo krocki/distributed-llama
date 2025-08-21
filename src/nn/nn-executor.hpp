@@ -84,6 +84,7 @@ typedef struct {
     PthreadHandler handler;
 } NnExecutorThread;
 
+
 class NnExecutor {
 private:
     NnNetExecution *netExecution;
@@ -92,6 +93,7 @@ private:
     std::vector<NnExecutorStep> steps;
     NnExecutorThread *threads;
     NnExecutorContext context;
+    
 public:
     NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::vector<NnExecutorDevice> *device, NnNetExecution *netExecution, NnNodeSynchronizer *synchronizer, bool benchmark);
     ~NnExecutor();

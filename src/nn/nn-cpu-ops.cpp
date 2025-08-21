@@ -1526,9 +1526,12 @@ NnCpuOpForward getCpuOpForward(NnOpCode code, NnOpQuantType quantType) {
     }
     if (code == OP_ROUTER) {
         if (quantType == F32_F32_F32) return routerForward_F32_F32;
+        if (quantType == Q80_F32_F32) return routerForward_F32_F32;  // Use same implementation - weights are F32
     }
     if (code == OP_WEIGHTED_SUM) {
         if (quantType == F32_F32_F32) return weightedSumForward_F32_F32;
+        if (quantType == Q80_F32_F32) return weightedSumForward_F32_F32;  // Use same implementation
+        if (quantType == Q80_Q80_F32) return weightedSumForward_F32_F32;  // Expert buffers can be Q80
     }
     return nullptr;
 }

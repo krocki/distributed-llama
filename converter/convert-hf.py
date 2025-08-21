@@ -71,13 +71,18 @@ class Processor:
                 f'model.layers.{l}.self_attn.o_proj.weight'])
 
             if (self.config['n_experts'] > 0):
+                # Router weights for MOE layer
+                p.append([wt,
+                    f'model.layers.{l}.mlp.gate.weight']) # router
+                    
+                # Expert weights for all N experts  
                 for e in range(self.config['n_experts']):
                     p.append([wt,
-                        f'model.layers.{l}.block_sparse_moe.experts.{e}.w3.weight']) # up
+                        f'model.layers.{l}.mlp.experts.{e}.up_proj.weight']) # up (w3)
                     p.append([wt,
-                        f'model.layers.{l}.block_sparse_moe.experts.{e}.w1.weight']) # gate
+                        f'model.layers.{l}.mlp.experts.{e}.gate_proj.weight']) # gate (w1)
                     p.append([wt,
-                        f'model.layers.{l}.block_sparse_moe.experts.{e}.w2.weight']) # down
+                        f'model.layers.{l}.mlp.experts.{e}.down_proj.weight']) # down (w2)
             else:
                 p.append([wt,
                     f'model.layers.{l}.mlp.gate_proj.weight']) # gate
@@ -146,6 +151,7 @@ def parseArchType(type: str):
         'llama': ArchType.LLAMA,
         'mistral': ArchType.LLAMA,
         'qwen3': ArchType.QWEN3,
+        'qwen3_moe': ArchType.QWEN3,  # Qwen3 MOE uses same arch as regular Qwen3
     }.get(type)
     if (archType is None):
         raise Exception(f'Unsupported arch type: {type}')
@@ -202,7 +208,7 @@ def loadConfig(folderPath: str, weightsFloatType: int):
         'files': files,
     }
 
-    nExperts = config.get('num_local_experts')
+    nExperts = config.get('num_local_experts') or config.get('num_experts')
     nActiveExperts = config.get('num_active_local_experts') or config.get('num_experts_per_tok')
     result['n_experts'] = int(nExperts) if nExperts is not None else 0
     result['n_active_experts'] = int(nActiveExperts) if nActiveExperts is not None else 0

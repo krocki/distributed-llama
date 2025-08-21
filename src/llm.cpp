@@ -111,7 +111,7 @@ void buildMoeSegment(NnSegmentConfigBuilder& ff, LlmHeader* h, NnUint layerIndex
              size2D(F_32, routerSlice.n, routerSlice.d0),
              NnRouterOpConfig{h->nExperts, h->nActiveExperts, 
                              expertIndicesBufferIndex, routingWeightsBufferIndex,
-                             size2D(h->weightType, routerSlice.n, routerSlice.d0)});
+                             size2D(F_32, routerSlice.n, routerSlice.d0)});  // Router weights must be F32
 
     // === TOP-K EXPERT COMPUTATIONS ===
     // Process top-k active experts sequentially
@@ -153,11 +153,21 @@ void buildMoeSegment(NnSegmentConfigBuilder& ff, LlmHeader* h, NnUint layerIndex
             size0(),
             NnMulOpCodeConfig{lBufferIndices[k]});                            // multiplier buffer
 
-        // Expert k W2 matmul: hidden -> output
+        // Expert k Cast to quantized buffer (like dense FFN)
+        if (weightVectorBufferIndices[k] != dqBufferIndices[k]) {
+            ff.addOp(
+                OP_CAST, ("expert" + std::to_string(k) + "_cast").c_str(), layerIndex,
+                pointerBatchConfig(SRC_BUFFER, weightVectorBufferIndices[k]),
+                pointerBatchConfig(SRC_BUFFER, dqBufferIndices[k]),
+                size0(),
+                NnCastOpCodeConfig{});
+        }
+
+        // Expert k W2 matmul: hidden -> output (use quantized buffer like dense FFN)
         ff.addOp(
             OP_MATMUL, ("block_matmul_w2" + std::string(expertSuffix)).c_str(), layerIndex,
-            pointerBatchConfig(SRC_BUFFER, weightVectorBufferIndices[k]),
-            pointerBatchConfig(SRC_BUFFER, expertBufferIndices[k]),           // Expert k output
+            pointerBatchConfig(SRC_BUFFER, dqBufferIndices[k]),               // Use quantized buffer (Q80)
+            pointerBatchConfig(SRC_BUFFER, expertBufferIndices[k]),           // Expert k final output buffer
             size2D(h->weightType, expertW2Slices[k].n0, expertW2Slices[k].d),
             NnMatmulOpConfig{});
     }
@@ -357,10 +367,46 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
             : nodeBuilder.addBuffer("q_d", size2D(h->syncType, nBatches, n.w1Slice.d0));
         const NnUint lBufferIndex = nodeBuilder.addBuffer("l", size2D(F_32, nBatches, n.w3Slice.d0));
         
-        // MOE-specific buffers (currently unused)
-        // NnUint expertIndicesBufferIndex = 0;
-        // NnUint routingWeightsBufferIndex = 0;
-        // NnUint expertOutputsBufferIndex = 0;
+        // MOE-specific buffers (allocated conditionally for MOE models)
+        NnUint routerLogitsBufferIndex = 0;
+        NnUint expertIndicesBufferIndex = 0;
+        NnUint routingWeightsBufferIndex = 0;
+        NnUint dBufferIndices[8];        // Max 8 active experts for now
+        NnUint weightVectorBufferIndices[8];
+        NnUint dqBufferIndices[8];
+        NnUint lBufferIndices[8];
+        
+        if (h->nExperts > 0) {
+            // MOE model - allocate additional buffers
+            routerLogitsBufferIndex = nodeBuilder.addBuffer("router_logits", size2D(F_32, nBatches, h->nExperts));
+            expertIndicesBufferIndex = nodeBuilder.addBuffer("expert_indices", size2D(F_32, nBatches, h->nActiveExperts));
+            routingWeightsBufferIndex = nodeBuilder.addBuffer("routing_weights", size2D(F_32, nBatches, h->nActiveExperts));
+            
+            // Per-expert intermediate buffers (follow same pattern as dense FFN)
+            NnUint expertHiddenSize = 768; // Qwen3 MOE moe_intermediate_size
+            
+            for (NnUint k = 0; k < h->nActiveExperts && k < 8; k++) {
+                char bufferName[64];
+                
+                // Expert final output buffer (F32 like dense dBufferIndex)
+                snprintf(bufferName, sizeof(bufferName), "d_expert_%d", k);
+                dBufferIndices[k] = nodeBuilder.addBuffer(bufferName, size2D(F_32, nBatches, h->dim));
+                
+                // Expert intermediate computation buffer (F32 like dense dBufferIndex) 
+                snprintf(bufferName, sizeof(bufferName), "weight_vector_%d", k);
+                weightVectorBufferIndices[k] = nodeBuilder.addBuffer(bufferName, size2D(F_32, nBatches, expertHiddenSize));
+                
+                // Expert intermediate quantized buffer (follows syncType like dense dqBufferIndex)
+                snprintf(bufferName, sizeof(bufferName), "dq_expert_%d", k);
+                dqBufferIndices[k] = (h->syncType == F_32) 
+                    ? weightVectorBufferIndices[k]  // Use same buffer if no quantization
+                    : nodeBuilder.addBuffer(bufferName, size2D(h->syncType, nBatches, expertHiddenSize));
+                
+                // Expert l buffer (F32 like dense lBufferIndex)
+                snprintf(bufferName, sizeof(bufferName), "l_expert_%d", k);
+                lBufferIndices[k] = nodeBuilder.addBuffer(bufferName, size2D(F_32, nBatches, expertHiddenSize));
+            }
+        }
         const NnUint ropeCacheBufferIndex = nodeBuilder.addBuffer("rope_cache", ropeSlice.cacheSize);
         const NnUint attBufferIndex = nodeBuilder.addBuffer("att", multiHeadAttSlice.attSize);
         const NnUint logitsSliceBufferIndex = nodeBuilder.addBuffer("lg", size2D(F_32, nBatches, h->vocabSize / nNodes));
@@ -543,10 +589,38 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
                 n.rmsNormSize,
                 NnRmsNormOpConfig{invRmsBufferIndex, 1});
             
-            // Dense FFN for regular models  
-            buildFfnSegment(ff, h, layerIndex, yBufferIndex, yqBufferIndex, 
-                           dBufferIndex, dqBufferIndex, lBufferIndex,
-                           n.w1Slice, n.w2Slice, n.w3Slice, "");
+            // FFN implementation: Dense vs MOE
+            if (h->nExperts > 0) {
+                // MOE model - use buildMoeSegment
+                printf("🧠 MOE model with %d experts, %d active\n", h->nExperts, h->nActiveExperts);
+                
+                // Create router slice (force F32 for router - OP_ROUTER only supports F32)
+                NnRowMatmulSlice routerSlice = sliceRowMatmul(F_32, nNodes, h->dim, h->nExperts);
+                
+                // Create expert weight slices (for active experts)
+                NnRowMatmulSlice expertW1Slices[8];  // Max 8 active experts
+                NnColMatmulSlice expertW2Slices[8];
+                NnRowMatmulSlice expertW3Slices[8];
+                
+                NnUint expertHiddenSize = 768; // Qwen3 MOE moe_intermediate_size
+                for (NnUint k = 0; k < h->nActiveExperts && k < 8; k++) {
+                    expertW1Slices[k] = sliceRowMatmul(h->weightType, nNodes, h->dim, expertHiddenSize);      // W1: 2048→768
+                    expertW2Slices[k] = sliceColMatmul(h->weightType, nNodes, expertHiddenSize, h->dim);      // W2: 768→2048
+                    expertW3Slices[k] = sliceRowMatmul(h->weightType, nNodes, h->dim, expertHiddenSize);      // W3: 2048→768
+                }
+                
+                buildMoeSegment(ff, h, layerIndex, yBufferIndex, yqBufferIndex, routerLogitsBufferIndex,
+                               expertIndicesBufferIndex, routingWeightsBufferIndex,
+                               dBufferIndices, weightVectorBufferIndices,
+                               dqBufferIndices, lBufferIndices,
+                               routerSlice,
+                               expertW1Slices, expertW2Slices, expertW3Slices);
+            } else {
+                // Dense FFN for regular models  
+                buildFfnSegment(ff, h, layerIndex, yBufferIndex, yqBufferIndex, 
+                               dBufferIndex, dqBufferIndex, lBufferIndex,
+                               n.w1Slice, n.w2Slice, n.w3Slice, "");
+            }
             
             ff.addOp(
                 OP_CAST, "block_cast_d3", layerIndex,
@@ -634,9 +708,46 @@ void loadLlmNetWeight(const char *path, LlmNet *net, NnRootWeightLoader *loader)
         b += loader->loadRowMatmulSlices("block_matmul_k", layerIndex, &net->kSlice, b);
         b += loader->loadRowMatmulSlices("block_matmul_v", layerIndex, &net->vSlice, b);
         b += loader->loadColMatmulSlices("block_matmul_wo", layerIndex, &net->woSlice, b);
-        b += loader->loadRowMatmulSlices("block_matmul_w1", layerIndex, &net->w1Slice, b);
-        b += loader->loadColMatmulSlices("block_matmul_w2", layerIndex, &net->w2Slice, b);
-        b += loader->loadRowMatmulSlices("block_matmul_w3", layerIndex, &net->w3Slice, b);
+        
+        if (net->header->nExperts > 0) {
+            // MOE model - load router + expert weights
+            // Router weights: dim × nExperts (force F32 - OP_ROUTER only supports F32)
+            NnRowMatmulSlice routerSlice = sliceRowMatmul(F_32, net->netConfig.nNodes, 
+                                                         net->header->dim, net->header->nExperts);
+            b += loader->loadRowMatmulSlices("block_router", layerIndex, &routerSlice, b);
+            
+            // Expert weights: load ALL experts (not just active ones)
+            // The weight file contains all N experts, buildMoeSegment selects top-k
+            for (NnUint expertId = 0; expertId < net->header->nExperts; expertId++) {
+                NnUint expertHiddenSize = 768; // Qwen3 MOE moe_intermediate_size
+                
+                // Expert expertId W3 (up_proj): dim → expertHiddenSize
+                NnRowMatmulSlice expertW3Slice = sliceRowMatmul(net->header->weightType, net->netConfig.nNodes, 
+                                                               net->header->dim, expertHiddenSize);
+                char expertW3Name[64];
+                snprintf(expertW3Name, sizeof(expertW3Name), "block_matmul_w3.%d", expertId);
+                b += loader->loadRowMatmulSlices(expertW3Name, layerIndex, &expertW3Slice, b);
+                
+                // Expert expertId W1 (gate_proj): dim → expertHiddenSize
+                NnRowMatmulSlice expertW1Slice = sliceRowMatmul(net->header->weightType, net->netConfig.nNodes, 
+                                                               net->header->dim, expertHiddenSize);
+                char expertW1Name[64];
+                snprintf(expertW1Name, sizeof(expertW1Name), "block_matmul_w1.%d", expertId);
+                b += loader->loadRowMatmulSlices(expertW1Name, layerIndex, &expertW1Slice, b);
+                
+                // Expert expertId W2 (down_proj): expertHiddenSize → dim
+                NnColMatmulSlice expertW2Slice = sliceColMatmul(net->header->weightType, net->netConfig.nNodes, 
+                                                               expertHiddenSize, net->header->dim);
+                char expertW2Name[64];
+                snprintf(expertW2Name, sizeof(expertW2Name), "block_matmul_w2.%d", expertId);
+                b += loader->loadColMatmulSlices(expertW2Name, layerIndex, &expertW2Slice, b);
+            }
+        } else {
+            // Dense model - load standard FFN weights
+            b += loader->loadRowMatmulSlices("block_matmul_w1", layerIndex, &net->w1Slice, b);
+            b += loader->loadColMatmulSlices("block_matmul_w2", layerIndex, &net->w2Slice, b);
+            b += loader->loadRowMatmulSlices("block_matmul_w3", layerIndex, &net->w3Slice, b);
+        }
         if (net->header->archType == QWEN3) {
             b += loader->loadAll("block_norm_q", layerIndex, net->qkRmsNormSize.nBytes, b);
             b += loader->loadAll("block_norm_k", layerIndex, net->qkRmsNormSize.nBytes, b);

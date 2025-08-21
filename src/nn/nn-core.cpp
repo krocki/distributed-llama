@@ -85,6 +85,7 @@ const char *opCodeToString(NnOpCode code) {
     if (code == OP_SHIFT) return "SHIFT";
     if (code == OP_ROUTER) return "ROUTER";
     if (code == OP_WEIGHTED_SUM) return "WEIGHTED_SUM";
+    if (code == OP_MATMUL_MOE) return "MATMUL_MOE";
     throw std::invalid_argument("Unknown op code");
 }
 

@@ -190,3 +190,4 @@ NnUint NnExecutor::getTotalTime(NnExecutorStepType type) {
     assert((NnUint)type < N_STEP_TYPES);
     return context.totalTime[type];
 }
+

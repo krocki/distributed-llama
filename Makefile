@@ -100,7 +100,30 @@ nn-test-ffn: src/nn/nn-test-ffn.cpp nn-quants.o nn-core.o nn-executor.o nn-netwo
 
 nn-test-moe-simple: src/nn/nn-test-moe-simple.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+
+nn-test-qwen3-moe: src/nn/nn-test-qwen3-moe.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+
+nn-test-qwen3-moe-simple: src/nn/nn-test-qwen3-moe-simple.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+
+nn-debug-weight-loading: src/nn/nn-debug-weight-loading.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-tensor-checker: src/nn/nn-tensor-checker.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
 nn-expert-selection-test: src/nn/nn-expert-selection-test.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-moe-manager.o: src/nn/nn-moe-manager.cpp
+	$(CXX) $(CXXFLAGS) -c $^ -o $@
+nn-test-dynamic-moe: src/nn/nn-test-dynamic-moe.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o nn-moe-manager.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-test-dynamic-dense: src/nn/nn-test-dynamic-dense.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-test-dynamic-moe-final: src/nn/nn-test-dynamic-moe-final.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-test-dynamic-real-model: src/nn/nn-test-dynamic-real-model.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+nn-validate-dynamic-concept: src/nn/nn-validate-dynamic-concept.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
 nn-vulkan.o: src/nn/nn-vulkan.cpp
 	$(CXX) $(CXXFLAGS) -c $^ -o $@
@@ -128,4 +151,6 @@ tokenizer-test: src/tokenizer-test.cpp nn-quants.o nn-core.o llamafile-sgemm.o n
 dllama: src/dllama.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o tokenizer.o llm.o app.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv, $^) -o $@ $(LIBS)
 dllama-api: src/dllama-api.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o tokenizer.o llm.o app.o ${DEPS}
+	$(CXX) $(CXXFLAGS) $(filter-out %.spv, $^) -o $@ $(LIBS)
+dllama-dynamic: src/dllama-dynamic.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o tokenizer.o llm.o app.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv, $^) -o $@ $(LIBS)

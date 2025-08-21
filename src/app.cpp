@@ -2,6 +2,9 @@
 #include <cassert>
 #include <cstring>
 #include <stdexcept>
+#include <memory>
+#include <string>
+#include "nn/nn-dynamic-executor.hpp"
 #if defined(DLLAMA_VULKAN)
     #include "nn/nn-vulkan.hpp"
 #endif
@@ -45,6 +48,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.gpuIndex = -1;
     args.gpuSegmentFrom = -1;
     args.gpuSegmentTo = -1;
+    args.dynamicMode = false;
 
     int i = 1;
     if (requireMode && argc > 1) {
@@ -120,6 +124,8 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.gpuSegmentTo = atoi(separator + 1);
         } else if (std::strcmp(name, "--net-turbo") == 0) {
             args.netTurbo = atoi(value) == 1;
+        } else if (std::strcmp(name, "--dynamic-mode") == 0) {
+            args.dynamicMode = atoi(value) == 1;
         } else {
             throw std::runtime_error("Unknown option: " + std::string(name));
         }
@@ -267,12 +273,64 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     }
 
     std::vector<NnExecutorDevice> devices = resolveDevices(args, &net.netConfig, rootNodeConfig, &execution);
-    NnExecutor executor(&net.netConfig, rootNodeConfig, &devices, &execution, synchronizer.get(), args->benchmark);
+    
+    // Create executor based on dynamic mode flag
+    std::unique_ptr<NnExecutor> executorPtr;
+    NnExecutor* executor;
+    
+    if (args->dynamicMode) {
+        printf("🚀 Dynamic tensor binding mode enabled\n");
+        auto dynamicExecutor = new NnDynamicExecutor(&net.netConfig, rootNodeConfig, &devices, &execution, synchronizer.get(), args->benchmark);
+        dynamicExecutor->enableDynamicMode(); // Enable TRUE dynamic tensor binding
+        executorPtr.reset(dynamicExecutor);
+        executor = dynamicExecutor;
+        printf("✅ Dynamic executor created (TRUE DYNAMIC MODE)\n");
+    } else {
+        executorPtr.reset(new NnExecutor(&net.netConfig, rootNodeConfig, &devices, &execution, synchronizer.get(), args->benchmark));
+        executor = executorPtr.get();
+        printf("✅ Standard executor created\n");
+    }
 
-    NnRootWeightLoader weightLoader(&executor, network, nNodes);
+    NnRootWeightLoader weightLoader(executor, network, nNodes);
+    printf("💿 Loading weights...\n");
     loadLlmNetWeight(args->modelPath, &net, &weightLoader);
+    printf("💿 Weights loaded\n");
 
-    RootLlmInference inference(&net, &execution, &executor, network);
+    // If dynamic mode is enabled, register operation slots and bind weights
+    if (args->dynamicMode) {
+        printf("🔗 Setting up dynamic tensor binding for dense model...\n");
+        
+        auto dynamicExecutor = static_cast<NnDynamicExecutor*>(executor);
+        
+        // Register operation slots for typical dense model operations
+        // These correspond to the operations created by buildFfnSegment in llm.cpp
+        printf("📝 Registering operation slots for dense model...\n");
+        
+        for (int layer = 0; layer < header.nLayers; layer++) {
+            dynamicExecutor->registerDynamicOperation("block_matmul_w1", layer);
+            dynamicExecutor->registerDynamicOperation("block_matmul_w2", layer);
+            dynamicExecutor->registerDynamicOperation("block_matmul_w3", layer);
+        }
+        
+        // Bind stored weights to operations
+        printf("🔗 Binding stored weights to operation slots...\n");
+        
+        for (int layer = 0; layer < header.nLayers; layer++) {
+            // The weights were stored with keys like "block_matmul_w1_layer_N"
+            std::string w1Key = "block_matmul_w1_layer_" + std::to_string(layer);
+            std::string w2Key = "block_matmul_w2_layer_" + std::to_string(layer);
+            std::string w3Key = "block_matmul_w3_layer_" + std::to_string(layer);
+            
+            dynamicExecutor->bindWeightToOperation("block_matmul_w1", layer, w1Key);
+            dynamicExecutor->bindWeightToOperation("block_matmul_w2", layer, w2Key);
+            dynamicExecutor->bindWeightToOperation("block_matmul_w3", layer, w3Key);
+        }
+        
+        printf("✅ Dynamic tensor binding setup complete!\n");
+        dynamicExecutor->printTensorPoolStatus();
+    }
+
+    RootLlmInference inference(&net, &execution, executor, network);
 
     if (network != nullptr) {
         network->resetStats();
@@ -289,7 +347,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     context.sampler = &sampler;
     context.tokenizer = &tokenizer;
     context.network = network;
-    context.executor = &executor;
+    context.executor = executor;
 
     handler(&context);
 

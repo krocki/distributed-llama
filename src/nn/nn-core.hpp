@@ -83,6 +83,7 @@ enum NnOpCode {
     OP_SHIFT,
     OP_ROUTER,
     OP_WEIGHTED_SUM,
+    OP_MATMUL_MOE,
 };
 
 enum NnOpQuantType {
@@ -204,6 +205,15 @@ typedef struct {
 typedef struct {
     // empty
 } NnMatmulOpConfig;
+
+typedef struct {
+    NnUint nExperts;
+    NnUint nActiveExperts;
+    NnUint slotIndex;  // Which slot (0-7) this operation represents
+    NnUint layerIndex;
+    NnUint expertIndicesBufferIndex;
+    const char* weightType;  // "w1", "w2", or "w3"
+} NnMoeMatmulOpConfig;
 
 typedef struct {
     NnRopeType type;

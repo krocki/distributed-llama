@@ -33,6 +33,7 @@ public:
     int gpuIndex;
     int gpuSegmentFrom;
     int gpuSegmentTo;
+    bool dynamicMode;
 
     // worker
     NnUint port;
